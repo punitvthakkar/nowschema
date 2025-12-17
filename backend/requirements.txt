@@ -1,0 +1,39 @@
+# Modal dependencies
+modal>=0.64.0
+
+# ML dependencies
+sentence-transformers>=2.6.0
+torch
+numpy
+hnswlib
+huggingface_hub>=0.23.0
+einops
+
+# API dependencies
+fastapi[standard]
+pydantic>=2.0.0
+
+# Database
+supabase>=2.0.0
+asyncpg
+
+# Cache & Rate Limiting
+upstash-redis>=1.0.0
+upstash-ratelimit>=1.0.0
+
+# Authentication
+python-jose[cryptography]
+passlib[bcrypt]
+workos>=4.0.0
+
+# Billing
+stripe>=7.0.0
+
+# Observability
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+
+# Utilities
+python-dotenv
+httpx
