@@ -172,6 +172,7 @@ class InMemoryUsageTracker:
 # ==================== PYDANTIC MODELS ====================
 
 from pydantic import BaseModel, Field
+from fastapi import Header
 
 
 class ErrorResponse(BaseModel):
@@ -321,7 +322,7 @@ class UniclassSearchService:
     # ==================== ENDPOINT 2: SEARCH (single + batch) ====================
 
     @modal.fastapi_endpoint(method="POST", docs=True)
-    async def search(self, item: dict, authorization: str = None) -> dict:
+    async def search(self, item: dict, authorization: str = Header(default=None)) -> dict:
         """
         Unified search endpoint for single and batch queries.
 
@@ -443,7 +444,7 @@ class UniclassSearchService:
     # ==================== ENDPOINT 3: INFO (stats + usage) ====================
 
     @modal.fastapi_endpoint(method="POST", docs=True)
-    async def info(self, item: dict, authorization: str = None) -> dict:
+    async def info(self, item: dict, authorization: str = Header(default=None)) -> dict:
         """
         Combined info endpoint for stats and usage.
 
@@ -492,7 +493,7 @@ class UniclassSearchService:
     # ==================== ENDPOINT 4: API_KEYS (placeholder) ====================
 
     @modal.fastapi_endpoint(method="POST", docs=True)
-    async def api_keys(self, item: dict, authorization: str = None) -> dict:
+    async def api_keys(self, item: dict, authorization: str = Header(default=None)) -> dict:
         """
         API key management endpoint (requires database - placeholder for now).
 
@@ -506,7 +507,7 @@ class UniclassSearchService:
     # ==================== ENDPOINT 5: BILLING (placeholder) ====================
 
     @modal.fastapi_endpoint(method="POST", docs=True)
-    async def billing(self, item: dict, authorization: str = None) -> dict:
+    async def billing(self, item: dict, authorization: str = Header(default=None)) -> dict:
         """
         Billing management endpoint (requires Stripe - placeholder for now).
 
