@@ -21,6 +21,7 @@ image = modal.Image.debian_slim(python_version="3.11").pip_install(
     "numpy",
     "hnswlib",
     "huggingface_hub>=0.23.0",
+    "einops",  # Required by sentence-transformers models
     # API
     "fastapi[standard]",
     "pydantic>=2.0.0",
