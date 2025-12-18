@@ -2,13 +2,18 @@
 Uniclass Search API - Enterprise Edition
 Deployed on Modal with full multi-tenancy, authentication, billing, and observability.
 Optimized for Modal free tier (6 endpoints).
+
+This file is SELF-CONTAINED - all code is inline, no external module imports.
 """
 import modal
 import os
 import time
 import json
-from datetime import datetime, timezone
+import hashlib
+import secrets
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
+from dataclasses import dataclass
 
 # Modal App
 app = modal.App("uniclass-api")
@@ -21,27 +26,147 @@ image = modal.Image.debian_slim(python_version="3.11").pip_install(
     "numpy",
     "hnswlib",
     "huggingface_hub>=0.23.0",
-    "einops",  # Required by sentence-transformers models
+    "einops",
     # API
     "fastapi[standard]",
     "pydantic>=2.0.0",
-    # Database
-    "supabase>=2.0.0",
-    # Cache & Rate Limiting
-    "upstash-redis>=1.0.0",
-    "upstash-ratelimit>=1.0.0",
-    # Auth
-    "python-jose[cryptography]",
-    "passlib[bcrypt]",
-    "workos>=4.0.0",
-    # Billing
-    "stripe>=7.0.0",
     # Utils
     "httpx",
 )
 
 # Volume for embeddings index
 volume = modal.Volume.from_name("uniclass-embeddings-vol", create_if_missing=True)
+
+
+# ==================== INLINE DATA CLASSES ====================
+
+@dataclass
+class RateLimitResult:
+    allowed: bool
+    remaining: int = 0
+    retry_after: int = 0
+
+
+@dataclass
+class CacheResult:
+    hit: bool
+    data: Any = None
+
+
+@dataclass
+class QuotaStatus:
+    used: int
+    limit: int
+    remaining: int
+    reset_date: datetime
+    percentage_used: float
+
+
+# ==================== INLINE SERVICES (IN-MEMORY) ====================
+
+class InMemoryRateLimiter:
+    """Simple in-memory rate limiter."""
+
+    def __init__(self):
+        self.requests: Dict[str, List[float]] = {}
+        self.limits = {
+            "free": 10,
+            "starter": 60,
+            "professional": 300,
+            "enterprise": 1000,
+        }
+
+    async def check(self, tenant_id: str, plan_tier: str, custom_limit: int = None) -> RateLimitResult:
+        limit = custom_limit or self.limits.get(plan_tier, 10)
+        now = time.time()
+        window = 60  # 1 minute
+
+        key = f"{tenant_id}:{plan_tier}"
+        if key not in self.requests:
+            self.requests[key] = []
+
+        # Clean old requests
+        self.requests[key] = [t for t in self.requests[key] if now - t < window]
+
+        if len(self.requests[key]) >= limit:
+            return RateLimitResult(allowed=False, remaining=0, retry_after=int(window - (now - self.requests[key][0])))
+
+        self.requests[key].append(now)
+        return RateLimitResult(allowed=True, remaining=limit - len(self.requests[key]))
+
+
+class InMemoryCache:
+    """Simple in-memory cache."""
+
+    def __init__(self):
+        self.cache: Dict[str, tuple] = {}  # key -> (data, expiry)
+        self.ttl = {
+            "free": 300,
+            "starter": 600,
+            "professional": 1800,
+            "enterprise": 3600,
+        }
+
+    def _make_key(self, query: str, top_k: int, tenant_id: str) -> str:
+        return hashlib.md5(f"{tenant_id}:{query}:{top_k}".encode()).hexdigest()
+
+    async def get(self, query: str, top_k: int, tenant_id: str) -> CacheResult:
+        key = self._make_key(query, top_k, tenant_id)
+        if key in self.cache:
+            data, expiry = self.cache[key]
+            if time.time() < expiry:
+                return CacheResult(hit=True, data=data)
+            del self.cache[key]
+        return CacheResult(hit=False)
+
+    async def set(self, query: str, top_k: int, data: Any, tenant_id: str, plan_tier: str):
+        key = self._make_key(query, top_k, tenant_id)
+        ttl = self.ttl.get(plan_tier, 300)
+        self.cache[key] = (data, time.time() + ttl)
+
+
+class InMemoryUsageTracker:
+    """Simple in-memory usage tracker."""
+
+    def __init__(self):
+        self.usage: Dict[str, int] = {}
+        self.quotas = {
+            "free": 100,
+            "starter": 10000,
+            "professional": 100000,
+            "enterprise": 1000000,
+        }
+
+    def _get_month_key(self, tenant_id: str) -> str:
+        return f"{tenant_id}:{datetime.now().strftime('%Y-%m')}"
+
+    async def can_proceed(self, tenant_id: str, plan_tier: str, query_count: int = 1) -> bool:
+        key = self._get_month_key(tenant_id)
+        current = self.usage.get(key, 0)
+        limit = self.quotas.get(plan_tier, 100)
+        return current + query_count <= limit
+
+    async def record_usage(self, tenant_id: str, query_count: int = 1, **kwargs):
+        key = self._get_month_key(tenant_id)
+        self.usage[key] = self.usage.get(key, 0) + query_count
+
+    async def check_quota(self, tenant_id: str, plan_tier: str) -> QuotaStatus:
+        key = self._get_month_key(tenant_id)
+        used = self.usage.get(key, 0)
+        limit = self.quotas.get(plan_tier, 100)
+        remaining = max(0, limit - used)
+
+        # Calculate next month reset
+        now = datetime.now(timezone.utc)
+        next_month = (now.replace(day=1) + timedelta(days=32)).replace(day=1)
+
+        return QuotaStatus(
+            used=used,
+            limit=limit,
+            remaining=remaining,
+            reset_date=next_month,
+            percentage_used=round((used / limit) * 100, 2) if limit > 0 else 0
+        )
 
 
 # ==================== PYDANTIC MODELS ====================
@@ -64,10 +189,10 @@ class ErrorResponse(BaseModel):
     gpu="T4",
     memory=8192,
     volumes={"/cache": volume},
-    container_idle_timeout=300,
-    allow_concurrent_inputs=10,
+    scaledown_window=300,  # Updated from container_idle_timeout
     secrets=[modal.Secret.from_name("uniclass-enterprise-secrets")],
 )
+@modal.concurrent(max_inputs=10)  # Updated from allow_concurrent_inputs
 class UniclassSearchService:
     """Enterprise Uniclass Search Service with full multi-tenancy."""
 
@@ -99,162 +224,46 @@ class UniclassSearchService:
         with open("/cache/results/uniclass_lookup.json", "r") as f:
             self.lookup = json.load(f)
 
-        # Initialize enterprise services
+        # Initialize in-memory services
         self._init_services()
 
         print(f"✅ Ready! {self.lookup['num_items']} items indexed.")
 
     def _init_services(self):
-        """Initialize enterprise services (database, cache, rate limiting, etc.)."""
-        from config import get_config
-        from services.database import init_db, get_db
-        from services.api_keys import APIKeyService
-        from services.rate_limit import RateLimitService, InMemoryRateLimitService
-        from services.cache import CacheService, InMemoryCacheService
-        from services.usage import UsageService, InMemoryUsageService
-        from services.billing import BillingService
-        from services.sso import SSOService
-        from services.auth import AuthService
+        """Initialize enterprise services (all in-memory for now)."""
 
-        self.config = get_config()
-        self.services_status = {}
+        # In-memory services (no external dependencies)
+        self.rate_limiter = InMemoryRateLimiter()
+        self.cache = InMemoryCache()
+        self.usage_service = InMemoryUsageTracker()
 
-        # Database (Supabase)
-        if self.config.has_supabase():
-            try:
-                self.db = init_db(self.config.supabase_url, self.config.supabase_service_key)
-                self.services_status["database"] = True
-                print("  → Database connected")
-            except Exception as e:
-                print(f"  ⚠ Database unavailable: {e}")
-                self.db = None
-                self.services_status["database"] = False
-        else:
-            self.db = None
-            self.services_status["database"] = False
-            print("  → Database not configured")
-
-        # Auth service
-        jwt_secret = os.environ.get("JWT_SECRET", "")
-        self.auth = AuthService(jwt_secret) if jwt_secret else None
-
-        # API Key service
-        if self.db:
-            self.api_keys = APIKeyService(self.db, self.config.is_production())
-        else:
-            self.api_keys = None
-
-        # Cache (Upstash Redis)
-        if self.config.has_redis():
-            try:
-                self.cache = CacheService(
-                    self.config.upstash_redis_url,
-                    self.config.upstash_redis_token
-                )
-                self.services_status["cache"] = True
-                print("  → Cache connected")
-            except Exception as e:
-                print(f"  ⚠ Cache unavailable: {e}")
-                self.cache = InMemoryCacheService()
-                self.services_status["cache"] = False
-        else:
-            self.cache = InMemoryCacheService()
-            self.services_status["cache"] = False
-            print("  → Using in-memory cache")
-
-        # Rate limiting
-        if self.config.has_redis():
-            try:
-                self.rate_limiter = RateLimitService(
-                    self.config.upstash_redis_url,
-                    self.config.upstash_redis_token
-                )
-                self.services_status["rate_limit"] = True
-                print("  → Rate limiting enabled")
-            except Exception as e:
-                print(f"  ⚠ Rate limiting unavailable: {e}")
-                self.rate_limiter = InMemoryRateLimitService()
-                self.services_status["rate_limit"] = False
-        else:
-            self.rate_limiter = InMemoryRateLimitService()
-            self.services_status["rate_limit"] = False
-            print("  → Using in-memory rate limiting")
-
-        # Usage tracking
-        if self.db:
-            self.usage_service = UsageService(self.db)
-            self.services_status["usage"] = True
-        else:
-            self.usage_service = InMemoryUsageService()
-            self.services_status["usage"] = False
-            print("  → Using in-memory usage tracking")
-
-        # Billing (Stripe)
-        if self.config.has_stripe() and self.db:
-            try:
-                self.billing = BillingService(
-                    db=self.db,
-                    stripe_secret_key=self.config.stripe_secret_key,
-                    stripe_webhook_secret=self.config.stripe_webhook_secret,
-                    price_ids={
-                        "starter": self.config.stripe_price_id_starter,
-                        "professional": self.config.stripe_price_id_professional,
-                        "enterprise": self.config.stripe_price_id_enterprise,
-                    }
-                )
-                self.services_status["billing"] = True
-                print("  → Billing enabled")
-            except Exception as e:
-                print(f"  ⚠ Billing unavailable: {e}")
-                self.billing = None
-                self.services_status["billing"] = False
-        else:
-            self.billing = None
-            self.services_status["billing"] = False
-
-        # SSO (WorkOS)
-        if self.config.has_workos() and self.db:
-            try:
-                redirect_uri = os.environ.get("SSO_REDIRECT_URI", "")
-                self.sso = SSOService(
-                    db=self.db,
-                    workos_api_key=self.config.workos_api_key,
-                    workos_client_id=self.config.workos_client_id,
-                    redirect_uri=redirect_uri,
-                )
-                self.services_status["sso"] = True
-                print("  → SSO enabled")
-            except Exception as e:
-                print(f"  ⚠ SSO unavailable: {e}")
-                self.sso = None
-                self.services_status["sso"] = False
-        else:
-            self.sso = None
-            self.services_status["sso"] = False
-
-        # Legacy API key (for backwards compatibility during migration)
+        # Legacy API key from environment
         self.legacy_api_key = os.environ.get("UNICLASS_API_KEY", "")
+
+        # Service status
+        self.services_status = {
+            "database": False,
+            "cache": True,  # In-memory
+            "rate_limit": True,  # In-memory
+            "usage": True,  # In-memory
+            "billing": False,
+            "sso": False,
+        }
+
+        print("  → Using in-memory services (no external dependencies)")
 
     # ==================== AUTHENTICATION ====================
 
     async def _authenticate(self, authorization: str) -> tuple:
-        """Authenticate a request using API key or JWT."""
+        """Authenticate a request using API key."""
         if not authorization:
             return None, None, ErrorResponse(error="Authentication required", code="AUTH_REQUIRED")
 
         token = authorization.replace("Bearer ", "").strip()
 
-        # Check legacy API key first (for migration)
+        # Check legacy API key
         if self.legacy_api_key and token == self.legacy_api_key:
             return {"id": "legacy", "plan_tier": "professional"}, None, None
-
-        # Validate with enterprise API key service
-        if self.api_keys:
-            validation = await self.api_keys.validate_key(token)
-            if validation.valid:
-                return validation.tenant, validation.api_key, None
-            else:
-                return None, None, ErrorResponse(error=validation.error, code="INVALID_API_KEY")
 
         return None, None, ErrorResponse(error="Invalid API key", code="INVALID_API_KEY")
 
@@ -295,7 +304,7 @@ class UniclassSearchService:
 
     # ==================== ENDPOINT 1: HEALTH (no auth) ====================
 
-    @modal.web_endpoint(method="GET", docs=True)
+    @modal.fastapi_endpoint(method="GET", docs=True)
     async def health(self) -> dict:
         """
         Health check endpoint (no auth required).
@@ -311,7 +320,7 @@ class UniclassSearchService:
 
     # ==================== ENDPOINT 2: SEARCH (single + batch) ====================
 
-    @modal.web_endpoint(method="POST", docs=True)
+    @modal.fastapi_endpoint(method="POST", docs=True)
     async def search(self, item: dict, authorization: str = None) -> dict:
         """
         Unified search endpoint for single and batch queries.
@@ -339,10 +348,7 @@ class UniclassSearchService:
         plan_tier = tenant["plan_tier"] if isinstance(tenant, dict) else tenant.plan_tier
 
         # Rate limit check
-        rate_result = await self._check_rate_limit(
-            tenant_id, plan_tier,
-            api_key.rate_limit_override if api_key else None
-        )
+        rate_result = await self._check_rate_limit(tenant_id, plan_tier, None)
         if not rate_result.allowed:
             return ErrorResponse(
                 error="Rate limit exceeded",
@@ -375,12 +381,7 @@ class UniclassSearchService:
             cache_result = await self.cache.get(query, top_k, tenant_id)
             if cache_result.hit:
                 latency = int((time.time() - start_time) * 1000)
-                if api_key:
-                    await self.usage_service.record_usage(
-                        tenant_id=tenant_id, api_key_id=api_key.id,
-                        endpoint="search", query_count=1,
-                        cache_hit=True, latency_ms=latency, status_code=200
-                    )
+                await self.usage_service.record_usage(tenant_id=tenant_id, query_count=1)
                 return {
                     "query": query, "top_k": top_k,
                     "count": len(cache_result.data),
@@ -396,12 +397,7 @@ class UniclassSearchService:
             await self.cache.set(query, top_k, results, tenant_id, plan_tier)
 
             # Log usage
-            if api_key:
-                await self.usage_service.record_usage(
-                    tenant_id=tenant_id, api_key_id=api_key.id,
-                    endpoint="search", query_count=1,
-                    cache_hit=False, latency_ms=latency, status_code=200
-                )
+            await self.usage_service.record_usage(tenant_id=tenant_id, query_count=1)
 
             return {
                 "query": query, "top_k": top_k,
@@ -434,14 +430,7 @@ class UniclassSearchService:
                     await self.cache.set(query, top_k, search_results, tenant_id, plan_tier)
 
             latency = int((time.time() - start_time) * 1000)
-
-            if api_key:
-                await self.usage_service.record_usage(
-                    tenant_id=tenant_id, api_key_id=api_key.id,
-                    endpoint="search_batch", query_count=len(queries),
-                    cache_hit=cache_hits == len(queries),
-                    latency_ms=latency, status_code=200
-                )
+            await self.usage_service.record_usage(tenant_id=tenant_id, query_count=len(queries))
 
             return {
                 "count": len(queries), "top_k": top_k,
@@ -453,7 +442,7 @@ class UniclassSearchService:
 
     # ==================== ENDPOINT 3: INFO (stats + usage) ====================
 
-    @modal.web_endpoint(method="POST", docs=True)
+    @modal.fastapi_endpoint(method="POST", docs=True)
     async def info(self, item: dict, authorization: str = None) -> dict:
         """
         Combined info endpoint for stats and usage.
@@ -500,193 +489,44 @@ class UniclassSearchService:
         else:
             return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
 
-    # ==================== ENDPOINT 4: API_KEYS (create + list + revoke) ====================
+    # ==================== ENDPOINT 4: API_KEYS (placeholder) ====================
 
-    @modal.web_endpoint(method="POST", docs=True)
+    @modal.fastapi_endpoint(method="POST", docs=True)
     async def api_keys(self, item: dict, authorization: str = None) -> dict:
         """
-        API key management endpoint.
+        API key management endpoint (requires database - placeholder for now).
 
         POST /api_keys
-
-        Create key:
-            {"action": "create", "name": "Production Key", "scopes": ["search"]}
-
-        List keys:
-            {"action": "list"}
-
-        Revoke key:
-            {"action": "revoke", "key_id": "uuid-here"}
         """
-        tenant, api_key, error = await self._authenticate(authorization)
-        if error:
-            return error.model_dump()
+        return ErrorResponse(
+            error="API key management requires database connection. Configure Supabase to enable.",
+            code="SERVICE_UNAVAILABLE"
+        ).model_dump()
 
-        if not self.api_keys:
-            return ErrorResponse(error="API key management not available", code="SERVICE_UNAVAILABLE").model_dump()
+    # ==================== ENDPOINT 5: BILLING (placeholder) ====================
 
-        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
-        action = item.get("action", "list")
-
-        # === CREATE ===
-        if action == "create":
-            user_id = api_key.user_id if api_key else "system"
-            name = item.get("name", "API Key")
-            scopes = item.get("scopes", ["search"])
-
-            raw_key, new_key = await self.api_keys.create_key(
-                tenant_id=tenant_id, user_id=user_id,
-                name=name, scopes=scopes
-            )
-
-            return {
-                "key": raw_key,
-                "id": new_key.id,
-                "name": new_key.name,
-                "prefix": new_key.key_prefix,
-                "scopes": new_key.scopes,
-                "created_at": new_key.created_at.isoformat(),
-                "warning": "Save this key! It will not be shown again."
-            }
-
-        # === LIST ===
-        elif action == "list":
-            keys = await self.api_keys.list_keys(tenant_id)
-            return {"keys": keys}
-
-        # === REVOKE ===
-        elif action == "revoke":
-            key_id = item.get("key_id")
-            if not key_id:
-                return ErrorResponse(error="Missing 'key_id'", code="MISSING_PARAM").model_dump()
-
-            success = await self.api_keys.revoke_key(key_id, tenant_id)
-
-            if success:
-                return {"status": "revoked", "key_id": key_id}
-            else:
-                return ErrorResponse(error="Key not found", code="NOT_FOUND").model_dump()
-
-        else:
-            return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
-
-    # ==================== ENDPOINT 5: BILLING (checkout + webhook) ====================
-
-    @modal.web_endpoint(method="POST", docs=True)
+    @modal.fastapi_endpoint(method="POST", docs=True)
     async def billing(self, item: dict, authorization: str = None) -> dict:
         """
-        Billing management endpoint.
+        Billing management endpoint (requires Stripe - placeholder for now).
 
         POST /billing
-
-        Create checkout session:
-            {"action": "checkout", "plan": "starter", "success_url": "...", "cancel_url": "..."}
-
-        Handle webhook (no auth):
-            {"action": "webhook", "event": {...}}
         """
-        action = item.get("action", "")
+        return ErrorResponse(
+            error="Billing requires Stripe configuration. Configure Stripe to enable.",
+            code="SERVICE_UNAVAILABLE"
+        ).model_dump()
 
-        # === WEBHOOK (no auth required - Stripe sends directly) ===
-        if action == "webhook":
-            if not self.billing:
-                return {"received": True, "processed": False}
+    # ==================== ENDPOINT 6: SSO (placeholder) ====================
 
-            try:
-                event_data = item.get("event", item)
-                await self.billing.handle_webhook(event_data)
-                return {"received": True, "processed": True}
-            except Exception as e:
-                return {"received": True, "processed": False, "error": str(e)}
-
-        # === CHECKOUT (auth required) ===
-        tenant, api_key, error = await self._authenticate(authorization)
-        if error:
-            return error.model_dump()
-
-        if action == "checkout":
-            if not self.billing:
-                return ErrorResponse(error="Billing not available", code="SERVICE_UNAVAILABLE").model_dump()
-
-            plan = item.get("plan", "starter")
-            success_url = item.get("success_url", "https://yourapp.com/success")
-            cancel_url = item.get("cancel_url", "https://yourapp.com/cancel")
-
-            tenant_obj = tenant if not isinstance(tenant, dict) else None
-            if not tenant_obj:
-                return ErrorResponse(error="Tenant not found", code="NOT_FOUND").model_dump()
-
-            customer_id = await self.billing.get_or_create_customer(
-                tenant_obj, email=f"billing@{tenant_obj.slug}.com"
-            )
-
-            checkout_url = await self.billing.create_checkout_session(
-                tenant_id=tenant_obj.id, customer_id=customer_id,
-                plan_tier=plan, success_url=success_url, cancel_url=cancel_url
-            )
-
-            return {"checkout_url": checkout_url}
-
-        else:
-            return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
-
-    # ==================== ENDPOINT 6: SSO (authorize + callback) ====================
-
-    @modal.web_endpoint(method="GET", docs=True)
-    async def sso(self, action: str = "authorize", domain: str = None, email: str = None, code: str = None) -> dict:
+    @modal.fastapi_endpoint(method="GET", docs=True)
+    async def sso(self, action: str = "authorize", domain: str = None) -> dict:
         """
-        SSO authentication endpoint.
+        SSO authentication endpoint (requires WorkOS - placeholder for now).
 
         GET /sso?action=authorize&domain=company.com
-        GET /sso?action=authorize&email=user@company.com
-        GET /sso?action=callback&code=auth-code-here
         """
-        if not self.sso:
-            return ErrorResponse(error="SSO not available", code="SERVICE_UNAVAILABLE").model_dump()
-
-        # === AUTHORIZE ===
-        if action == "authorize":
-            if email and not domain:
-                domain = email.split("@")[1] if "@" in email else None
-
-            if not domain:
-                return ErrorResponse(error="Missing domain or email", code="MISSING_PARAM").model_dump()
-
-            tenant = await self.sso.detect_sso_domain(f"user@{domain}")
-            if not tenant:
-                return ErrorResponse(error="SSO not configured for this domain", code="SSO_NOT_CONFIGURED").model_dump()
-
-            auth_url = self.sso.get_authorization_url(domain=domain)
-            return {"authorization_url": auth_url}
-
-        # === CALLBACK ===
-        elif action == "callback":
-            if not code:
-                return ErrorResponse(error="Missing authorization code", code="MISSING_PARAM").model_dump()
-
-            try:
-                profile, user, tenant = await self.sso.handle_callback(code)
-
-                if not user and tenant:
-                    user = await self.sso.provision_user(profile, tenant.id)
-
-                if user and self.auth:
-                    tokens = self.auth.create_token_pair(
-                        user_id=user.id, tenant_id=user.tenant_id,
-                        email=user.email, role=user.role
-                    )
-                    return {
-                        "access_token": tokens.access_token,
-                        "refresh_token": tokens.refresh_token,
-                        "token_type": tokens.token_type,
-                        "expires_in": tokens.expires_in,
-                        "user": {"id": user.id, "email": user.email, "role": user.role}
-                    }
-
-                return ErrorResponse(error="Unable to authenticate", code="AUTH_FAILED").model_dump()
-
-            except Exception as e:
-                return ErrorResponse(error=f"SSO callback failed: {str(e)}", code="SSO_ERROR").model_dump()
-
-        else:
-            return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
+        return ErrorResponse(
+            error="SSO requires WorkOS configuration. Configure WorkOS to enable.",
+            code="SERVICE_UNAVAILABLE"
+        ).model_dump()
