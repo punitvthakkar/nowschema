@@ -1,6 +1,7 @@
 """
 Uniclass Search API - Enterprise Edition
 Deployed on Modal with full multi-tenancy, authentication, billing, and observability.
+Optimized for Modal free tier (6 endpoints).
 """
 import modal
 import os
@@ -47,91 +48,11 @@ volume = modal.Volume.from_name("uniclass-embeddings-vol", create_if_missing=Tru
 from pydantic import BaseModel, Field
 
 
-class SearchRequest(BaseModel):
-    """Single search request."""
-    query: str = Field(..., min_length=1, max_length=500)
-    top_k: int = Field(default=10, ge=1, le=100)
-
-
-class BatchSearchRequest(BaseModel):
-    """Batch search request."""
-    queries: List[str] = Field(..., min_items=1, max_items=100)
-    top_k: int = Field(default=10, ge=1, le=100)
-
-
-class SearchResult(BaseModel):
-    """Single search result."""
-    code: str
-    title: str
-    table: str
-    similarity: float
-
-
-class SearchResponse(BaseModel):
-    """Search response."""
-    query: str
-    top_k: int
-    count: int
-    results: List[SearchResult]
-    cached: bool = False
-    latency_ms: int = 0
-
-
-class BatchSearchResponse(BaseModel):
-    """Batch search response."""
-    count: int
-    top_k: int
-    results: Dict[str, List[SearchResult]]
-    latency_ms: int = 0
-
-
 class ErrorResponse(BaseModel):
     """Error response."""
     error: str
     code: str
     details: Optional[Dict[str, Any]] = None
-
-
-class HealthResponse(BaseModel):
-    """Health check response."""
-    status: str
-    items_indexed: int
-    embedding_dim: int
-    services: Dict[str, bool]
-
-
-class StatsResponse(BaseModel):
-    """Statistics response."""
-    total_items: int
-    embedding_dim: int
-    index_params: Dict[str, Any]
-    tables: List[str]
-
-
-class APIKeyCreateRequest(BaseModel):
-    """API key creation request."""
-    name: str = Field(..., min_length=1, max_length=100)
-    scopes: List[str] = Field(default=["search"])
-
-
-class APIKeyResponse(BaseModel):
-    """API key response (shown only once)."""
-    key: str
-    id: str
-    name: str
-    prefix: str
-    scopes: List[str]
-    created_at: str
-
-
-class UsageResponse(BaseModel):
-    """Usage statistics response."""
-    period: str
-    total_queries: int
-    quota_limit: int
-    quota_remaining: int
-    quota_reset: str
-    cache_hit_rate: float
 
 
 # ==================== MAIN SERVICE CLASS ====================
@@ -260,10 +181,10 @@ class UniclassSearchService:
 
         # Usage tracking
         if self.db:
-            self.usage = UsageService(self.db)
+            self.usage_service = UsageService(self.db)
             self.services_status["usage"] = True
         else:
-            self.usage = InMemoryUsageService()
+            self.usage_service = InMemoryUsageService()
             self.services_status["usage"] = False
             print("  → Using in-memory usage tracking")
 
@@ -316,24 +237,14 @@ class UniclassSearchService:
     # ==================== AUTHENTICATION ====================
 
     async def _authenticate(self, authorization: str) -> tuple:
-        """
-        Authenticate a request using API key or JWT.
-
-        Returns:
-            (tenant, api_key, error_response)
-        """
+        """Authenticate a request using API key or JWT."""
         if not authorization:
-            return None, None, ErrorResponse(
-                error="Authentication required",
-                code="AUTH_REQUIRED",
-            )
+            return None, None, ErrorResponse(error="Authentication required", code="AUTH_REQUIRED")
 
-        # Extract token
         token = authorization.replace("Bearer ", "").strip()
 
         # Check legacy API key first (for migration)
         if self.legacy_api_key and token == self.legacy_api_key:
-            # Return mock tenant for legacy key
             return {"id": "legacy", "plan_tier": "professional"}, None, None
 
         # Validate with enterprise API key service
@@ -342,16 +253,9 @@ class UniclassSearchService:
             if validation.valid:
                 return validation.tenant, validation.api_key, None
             else:
-                return None, None, ErrorResponse(
-                    error=validation.error,
-                    code="INVALID_API_KEY",
-                )
+                return None, None, ErrorResponse(error=validation.error, code="INVALID_API_KEY")
 
-        # Fall back to legacy check
-        return None, None, ErrorResponse(
-            error="Invalid API key",
-            code="INVALID_API_KEY",
-        )
+        return None, None, ErrorResponse(error="Invalid API key", code="INVALID_API_KEY")
 
     async def _check_rate_limit(self, tenant_id: str, plan_tier: str, custom_limit: int = None):
         """Check rate limit for request."""
@@ -359,7 +263,7 @@ class UniclassSearchService:
 
     async def _check_quota(self, tenant_id: str, plan_tier: str, query_count: int = 1):
         """Check if request is within quota."""
-        return await self.usage.can_proceed(tenant_id, plan_tier, query_count)
+        return await self.usage_service.can_proceed(tenant_id, plan_tier, query_count)
 
     # ==================== CORE SEARCH ====================
 
@@ -388,11 +292,15 @@ class UniclassSearchService:
 
         return results
 
-    # ==================== PUBLIC ENDPOINTS ====================
+    # ==================== ENDPOINT 1: HEALTH (no auth) ====================
 
     @modal.web_endpoint(method="GET", docs=True)
     async def health(self) -> dict:
-        """Health check endpoint (no auth required)."""
+        """
+        Health check endpoint (no auth required).
+
+        GET /health
+        """
         return {
             "status": "healthy",
             "items_indexed": self.lookup["num_items"],
@@ -400,117 +308,24 @@ class UniclassSearchService:
             "services": self.services_status,
         }
 
-    @modal.web_endpoint(method="GET", docs=True)
-    async def search_get(
-        self,
-        q: str,
-        top_k: int = 10,
-        authorization: str = None,
-    ) -> dict:
-        """
-        GET endpoint for Uniclass search.
-
-        Headers: Authorization: Bearer <your-api-key>
-        Usage: /search_get?q=door+handle&top_k=5
-        """
-        start_time = time.time()
-
-        # Authenticate
-        tenant, api_key, error = await self._authenticate(authorization)
-        if error:
-            return error.model_dump()
-
-        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
-        plan_tier = tenant["plan_tier"] if isinstance(tenant, dict) else tenant.plan_tier
-
-        # Rate limit check
-        rate_result = await self._check_rate_limit(
-            tenant_id,
-            plan_tier,
-            api_key.rate_limit_override if api_key else None
-        )
-        if not rate_result.allowed:
-            return ErrorResponse(
-                error="Rate limit exceeded",
-                code="RATE_LIMITED",
-                details={"retry_after": rate_result.retry_after}
-            ).model_dump()
-
-        # Quota check
-        if not await self._check_quota(tenant_id, plan_tier):
-            return ErrorResponse(
-                error="Monthly quota exceeded",
-                code="QUOTA_EXCEEDED",
-            ).model_dump()
-
-        if not q:
-            return ErrorResponse(error="Missing query parameter 'q'", code="MISSING_PARAM").model_dump()
-
-        # Check cache
-        cache_result = await self.cache.get(q, top_k, tenant_id)
-        if cache_result.hit:
-            latency = int((time.time() - start_time) * 1000)
-
-            # Log usage (cache hit)
-            if api_key:
-                await self.usage.record_usage(
-                    tenant_id=tenant_id,
-                    api_key_id=api_key.id,
-                    endpoint="search_get",
-                    query_count=1,
-                    cache_hit=True,
-                    latency_ms=latency,
-                    status_code=200,
-                )
-
-            return {
-                "query": q,
-                "top_k": top_k,
-                "count": len(cache_result.data),
-                "results": cache_result.data,
-                "cached": True,
-                "latency_ms": latency,
-            }
-
-        # Execute search
-        results = self._search(q, top_k)
-        latency = int((time.time() - start_time) * 1000)
-
-        # Cache results
-        await self.cache.set(q, top_k, results, tenant_id, plan_tier)
-
-        # Log usage
-        if api_key:
-            await self.usage.record_usage(
-                tenant_id=tenant_id,
-                api_key_id=api_key.id,
-                endpoint="search_get",
-                query_count=1,
-                cache_hit=False,
-                latency_ms=latency,
-                status_code=200,
-            )
-
-        return {
-            "query": q,
-            "top_k": top_k,
-            "count": len(results),
-            "results": results,
-            "cached": False,
-            "latency_ms": latency,
-        }
+    # ==================== ENDPOINT 2: SEARCH (single + batch) ====================
 
     @modal.web_endpoint(method="POST", docs=True)
-    async def search_post(
-        self,
-        item: dict,
-        authorization: str = None,
-    ) -> dict:
+    async def search(self, item: dict, authorization: str = None) -> dict:
         """
-        POST endpoint for Uniclass search.
+        Unified search endpoint for single and batch queries.
 
-        Headers: Authorization: Bearer <your-api-key>
-        Body: {"query": "door handle", "top_k": 5}
+        POST /search
+
+        Single search:
+            {"action": "single", "query": "door handle", "top_k": 5}
+
+        Batch search:
+            {"action": "batch", "queries": ["door handle", "concrete slab"], "top_k": 5}
+
+        For backwards compatibility, if no action specified:
+            - If "query" present -> single search
+            - If "queries" present -> batch search
         """
         start_time = time.time()
 
@@ -524,8 +339,7 @@ class UniclassSearchService:
 
         # Rate limit check
         rate_result = await self._check_rate_limit(
-            tenant_id,
-            plan_tier,
+            tenant_id, plan_tier,
             api_key.rate_limit_override if api_key else None
         )
         if not rate_result.allowed:
@@ -535,401 +349,343 @@ class UniclassSearchService:
                 details={"retry_after": rate_result.retry_after}
             ).model_dump()
 
-        query = item.get("query", "")
+        # Determine action
+        action = item.get("action", "")
+        if not action:
+            # Auto-detect for backwards compatibility
+            if "queries" in item:
+                action = "batch"
+            else:
+                action = "single"
+
         top_k = item.get("top_k", 10)
 
-        if not query:
-            return ErrorResponse(error="Missing 'query' in request body", code="MISSING_PARAM").model_dump()
+        # === SINGLE SEARCH ===
+        if action == "single":
+            query = item.get("query", "")
+            if not query:
+                return ErrorResponse(error="Missing 'query'", code="MISSING_PARAM").model_dump()
 
-        # Quota check
-        if not await self._check_quota(tenant_id, plan_tier):
-            return ErrorResponse(error="Monthly quota exceeded", code="QUOTA_EXCEEDED").model_dump()
+            # Quota check
+            if not await self._check_quota(tenant_id, plan_tier):
+                return ErrorResponse(error="Monthly quota exceeded", code="QUOTA_EXCEEDED").model_dump()
 
-        # Check cache
-        cache_result = await self.cache.get(query, top_k, tenant_id)
-        if cache_result.hit:
-            latency = int((time.time() - start_time) * 1000)
-            if api_key:
-                await self.usage.record_usage(
-                    tenant_id=tenant_id,
-                    api_key_id=api_key.id,
-                    endpoint="search_post",
-                    query_count=1,
-                    cache_hit=True,
-                    latency_ms=latency,
-                    status_code=200,
-                )
-            return {
-                "query": query,
-                "top_k": top_k,
-                "count": len(cache_result.data),
-                "results": cache_result.data,
-                "cached": True,
-                "latency_ms": latency,
-            }
-
-        # Execute search
-        results = self._search(query, top_k)
-        latency = int((time.time() - start_time) * 1000)
-
-        # Cache results
-        await self.cache.set(query, top_k, results, tenant_id, plan_tier)
-
-        # Log usage
-        if api_key:
-            await self.usage.record_usage(
-                tenant_id=tenant_id,
-                api_key_id=api_key.id,
-                endpoint="search_post",
-                query_count=1,
-                cache_hit=False,
-                latency_ms=latency,
-                status_code=200,
-            )
-
-        return {
-            "query": query,
-            "top_k": top_k,
-            "count": len(results),
-            "results": results,
-            "cached": False,
-            "latency_ms": latency,
-        }
-
-    @modal.web_endpoint(method="POST", docs=True)
-    async def batch_search(
-        self,
-        item: dict,
-        authorization: str = None,
-    ) -> dict:
-        """
-        Batch search multiple queries at once.
-
-        Headers: Authorization: Bearer <your-api-key>
-        Body: {"queries": ["door handle", "concrete slab"], "top_k": 5}
-        """
-        start_time = time.time()
-
-        # Authenticate
-        tenant, api_key, error = await self._authenticate(authorization)
-        if error:
-            return error.model_dump()
-
-        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
-        plan_tier = tenant["plan_tier"] if isinstance(tenant, dict) else tenant.plan_tier
-
-        queries = item.get("queries", [])
-        top_k = item.get("top_k", 10)
-
-        if not queries:
-            return ErrorResponse(error="Missing 'queries' in request body", code="MISSING_PARAM").model_dump()
-
-        # Rate limit check
-        rate_result = await self._check_rate_limit(
-            tenant_id,
-            plan_tier,
-            api_key.rate_limit_override if api_key else None
-        )
-        if not rate_result.allowed:
-            return ErrorResponse(
-                error="Rate limit exceeded",
-                code="RATE_LIMITED",
-                details={"retry_after": rate_result.retry_after}
-            ).model_dump()
-
-        # Quota check (for all queries)
-        if not await self._check_quota(tenant_id, plan_tier, len(queries)):
-            return ErrorResponse(error="Monthly quota exceeded", code="QUOTA_EXCEEDED").model_dump()
-
-        # Execute searches
-        results = {}
-        cache_hits = 0
-
-        for query in queries:
-            # Check cache first
+            # Check cache
             cache_result = await self.cache.get(query, top_k, tenant_id)
             if cache_result.hit:
-                results[query] = cache_result.data
-                cache_hits += 1
-            else:
-                search_results = self._search(query, top_k)
-                results[query] = search_results
-                await self.cache.set(query, top_k, search_results, tenant_id, plan_tier)
-
-        latency = int((time.time() - start_time) * 1000)
-
-        # Log usage
-        if api_key:
-            await self.usage.record_usage(
-                tenant_id=tenant_id,
-                api_key_id=api_key.id,
-                endpoint="batch_search",
-                query_count=len(queries),
-                cache_hit=cache_hits == len(queries),
-                latency_ms=latency,
-                status_code=200,
-            )
-
-        return {
-            "count": len(queries),
-            "top_k": top_k,
-            "results": results,
-            "latency_ms": latency,
-        }
-
-    @modal.web_endpoint(method="GET", docs=True)
-    async def stats(self, authorization: str = None) -> dict:
-        """Get index statistics."""
-        tenant, api_key, error = await self._authenticate(authorization)
-        if error:
-            return error.model_dump()
-
-        return {
-            "total_items": self.lookup["num_items"],
-            "embedding_dim": self.lookup["embedding_dim"],
-            "index_params": self.lookup["index_params"],
-            "tables": list(set(m["table"] for m in self.lookup["metadata"]))
-        }
-
-    @modal.web_endpoint(method="GET", docs=True)
-    async def usage(self, authorization: str = None) -> dict:
-        """Get usage statistics for current tenant."""
-        tenant, api_key, error = await self._authenticate(authorization)
-        if error:
-            return error.model_dump()
-
-        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
-        plan_tier = tenant["plan_tier"] if isinstance(tenant, dict) else tenant.plan_tier
-
-        quota_status = await self.usage.check_quota(tenant_id, plan_tier)
-
-        return {
-            "period": "current_month",
-            "total_queries": quota_status.used,
-            "quota_limit": quota_status.limit,
-            "quota_remaining": quota_status.remaining,
-            "quota_reset": quota_status.reset_date.isoformat(),
-            "percentage_used": quota_status.percentage_used,
-        }
-
-    # ==================== API KEY MANAGEMENT ====================
-
-    @modal.web_endpoint(method="POST", docs=True)
-    async def create_api_key(
-        self,
-        item: dict,
-        authorization: str = None,
-    ) -> dict:
-        """
-        Create a new API key.
-
-        Body: {"name": "Production Key", "scopes": ["search"]}
-        """
-        tenant, api_key, error = await self._authenticate(authorization)
-        if error:
-            return error.model_dump()
-
-        if not self.api_keys:
-            return ErrorResponse(error="API key management not available", code="SERVICE_UNAVAILABLE").model_dump()
-
-        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
-        user_id = api_key.user_id if api_key else "system"
-
-        name = item.get("name", "API Key")
-        scopes = item.get("scopes", ["search"])
-
-        raw_key, new_key = await self.api_keys.create_key(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            name=name,
-            scopes=scopes,
-        )
-
-        return {
-            "key": raw_key,  # Only shown once!
-            "id": new_key.id,
-            "name": new_key.name,
-            "prefix": new_key.key_prefix,
-            "scopes": new_key.scopes,
-            "created_at": new_key.created_at.isoformat(),
-            "warning": "Save this key! It will not be shown again.",
-        }
-
-    @modal.web_endpoint(method="GET", docs=True)
-    async def list_api_keys(self, authorization: str = None) -> dict:
-        """List all API keys for current tenant."""
-        tenant, api_key, error = await self._authenticate(authorization)
-        if error:
-            return error.model_dump()
-
-        if not self.api_keys:
-            return ErrorResponse(error="API key management not available", code="SERVICE_UNAVAILABLE").model_dump()
-
-        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
-        keys = await self.api_keys.list_keys(tenant_id)
-
-        return {"keys": keys}
-
-    @modal.web_endpoint(method="POST", docs=True)
-    async def revoke_api_key(
-        self,
-        item: dict,
-        authorization: str = None,
-    ) -> dict:
-        """
-        Revoke an API key.
-
-        Body: {"key_id": "key-uuid"}
-        """
-        tenant, api_key, error = await self._authenticate(authorization)
-        if error:
-            return error.model_dump()
-
-        if not self.api_keys:
-            return ErrorResponse(error="API key management not available", code="SERVICE_UNAVAILABLE").model_dump()
-
-        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
-        key_id = item.get("key_id")
-
-        if not key_id:
-            return ErrorResponse(error="Missing 'key_id'", code="MISSING_PARAM").model_dump()
-
-        success = await self.api_keys.revoke_key(key_id, tenant_id)
-
-        if success:
-            return {"status": "revoked", "key_id": key_id}
-        else:
-            return ErrorResponse(error="Key not found", code="NOT_FOUND").model_dump()
-
-    # ==================== BILLING ENDPOINTS ====================
-
-    @modal.web_endpoint(method="POST", docs=True)
-    async def create_checkout_session(
-        self,
-        item: dict,
-        authorization: str = None,
-    ) -> dict:
-        """
-        Create a Stripe checkout session for subscription.
-
-        Body: {"plan": "starter", "success_url": "...", "cancel_url": "..."}
-        """
-        tenant, api_key, error = await self._authenticate(authorization)
-        if error:
-            return error.model_dump()
-
-        if not self.billing:
-            return ErrorResponse(error="Billing not available", code="SERVICE_UNAVAILABLE").model_dump()
-
-        plan = item.get("plan", "starter")
-        success_url = item.get("success_url", "https://yourapp.com/success")
-        cancel_url = item.get("cancel_url", "https://yourapp.com/cancel")
-
-        tenant_obj = tenant if not isinstance(tenant, dict) else None
-        if not tenant_obj:
-            return ErrorResponse(error="Tenant not found", code="NOT_FOUND").model_dump()
-
-        # Get or create customer
-        customer_id = await self.billing.get_or_create_customer(
-            tenant_obj,
-            email=f"billing@{tenant_obj.slug}.com"  # Would get from user
-        )
-
-        # Create checkout session
-        checkout_url = await self.billing.create_checkout_session(
-            tenant_id=tenant_obj.id,
-            customer_id=customer_id,
-            plan_tier=plan,
-            success_url=success_url,
-            cancel_url=cancel_url,
-        )
-
-        return {"checkout_url": checkout_url}
-
-    @modal.web_endpoint(method="POST", docs=True)
-    async def stripe_webhook(self, item: dict) -> dict:
-        """Handle Stripe webhook events."""
-        if not self.billing:
-            return {"received": True, "processed": False}
-
-        # In production, verify signature from headers
-        # signature = request.headers.get("Stripe-Signature")
-        # event = self.billing.verify_webhook(payload, signature)
-
-        try:
-            await self.billing.handle_webhook(item)
-            return {"received": True, "processed": True}
-        except Exception as e:
-            return {"received": True, "processed": False, "error": str(e)}
-
-    # ==================== SSO ENDPOINTS ====================
-
-    @modal.web_endpoint(method="GET", docs=True)
-    async def sso_authorize(
-        self,
-        domain: str = None,
-        email: str = None,
-    ) -> dict:
-        """
-        Get SSO authorization URL.
-
-        Usage: /sso_authorize?domain=company.com or /sso_authorize?email=user@company.com
-        """
-        if not self.sso:
-            return ErrorResponse(error="SSO not available", code="SERVICE_UNAVAILABLE").model_dump()
-
-        if email and not domain:
-            domain = email.split("@")[1] if "@" in email else None
-
-        if not domain:
-            return ErrorResponse(error="Missing domain or email", code="MISSING_PARAM").model_dump()
-
-        # Check if domain has SSO configured
-        tenant = await self.sso.detect_sso_domain(f"user@{domain}")
-        if not tenant:
-            return ErrorResponse(error="SSO not configured for this domain", code="SSO_NOT_CONFIGURED").model_dump()
-
-        auth_url = self.sso.get_authorization_url(domain=domain)
-
-        return {"authorization_url": auth_url}
-
-    @modal.web_endpoint(method="GET", docs=True)
-    async def sso_callback(self, code: str) -> dict:
-        """Handle SSO callback."""
-        if not self.sso:
-            return ErrorResponse(error="SSO not available", code="SERVICE_UNAVAILABLE").model_dump()
-
-        if not code:
-            return ErrorResponse(error="Missing authorization code", code="MISSING_PARAM").model_dump()
-
-        try:
-            profile, user, tenant = await self.sso.handle_callback(code)
-
-            # Just-in-time provisioning if user doesn't exist
-            if not user and tenant:
-                user = await self.sso.provision_user(profile, tenant.id)
-
-            # Generate tokens
-            if user and self.auth:
-                tokens = self.auth.create_token_pair(
-                    user_id=user.id,
-                    tenant_id=user.tenant_id,
-                    email=user.email,
-                    role=user.role,
-                )
+                latency = int((time.time() - start_time) * 1000)
+                if api_key:
+                    await self.usage_service.record_usage(
+                        tenant_id=tenant_id, api_key_id=api_key.id,
+                        endpoint="search", query_count=1,
+                        cache_hit=True, latency_ms=latency, status_code=200
+                    )
                 return {
-                    "access_token": tokens.access_token,
-                    "refresh_token": tokens.refresh_token,
-                    "token_type": tokens.token_type,
-                    "expires_in": tokens.expires_in,
-                    "user": {
-                        "id": user.id,
-                        "email": user.email,
-                        "role": user.role,
-                    }
+                    "query": query, "top_k": top_k,
+                    "count": len(cache_result.data),
+                    "results": cache_result.data,
+                    "cached": True, "latency_ms": latency
                 }
 
-            return ErrorResponse(error="Unable to authenticate", code="AUTH_FAILED").model_dump()
+            # Execute search
+            results = self._search(query, top_k)
+            latency = int((time.time() - start_time) * 1000)
 
-        except Exception as e:
-            return ErrorResponse(error=f"SSO callback failed: {str(e)}", code="SSO_ERROR").model_dump()
+            # Cache results
+            await self.cache.set(query, top_k, results, tenant_id, plan_tier)
+
+            # Log usage
+            if api_key:
+                await self.usage_service.record_usage(
+                    tenant_id=tenant_id, api_key_id=api_key.id,
+                    endpoint="search", query_count=1,
+                    cache_hit=False, latency_ms=latency, status_code=200
+                )
+
+            return {
+                "query": query, "top_k": top_k,
+                "count": len(results), "results": results,
+                "cached": False, "latency_ms": latency
+            }
+
+        # === BATCH SEARCH ===
+        elif action == "batch":
+            queries = item.get("queries", [])
+            if not queries:
+                return ErrorResponse(error="Missing 'queries'", code="MISSING_PARAM").model_dump()
+
+            # Quota check
+            if not await self._check_quota(tenant_id, plan_tier, len(queries)):
+                return ErrorResponse(error="Monthly quota exceeded", code="QUOTA_EXCEEDED").model_dump()
+
+            # Execute searches
+            results = {}
+            cache_hits = 0
+
+            for query in queries:
+                cache_result = await self.cache.get(query, top_k, tenant_id)
+                if cache_result.hit:
+                    results[query] = cache_result.data
+                    cache_hits += 1
+                else:
+                    search_results = self._search(query, top_k)
+                    results[query] = search_results
+                    await self.cache.set(query, top_k, search_results, tenant_id, plan_tier)
+
+            latency = int((time.time() - start_time) * 1000)
+
+            if api_key:
+                await self.usage_service.record_usage(
+                    tenant_id=tenant_id, api_key_id=api_key.id,
+                    endpoint="search_batch", query_count=len(queries),
+                    cache_hit=cache_hits == len(queries),
+                    latency_ms=latency, status_code=200
+                )
+
+            return {
+                "count": len(queries), "top_k": top_k,
+                "results": results, "latency_ms": latency
+            }
+
+        else:
+            return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
+
+    # ==================== ENDPOINT 3: INFO (stats + usage) ====================
+
+    @modal.web_endpoint(method="POST", docs=True)
+    async def info(self, item: dict, authorization: str = None) -> dict:
+        """
+        Combined info endpoint for stats and usage.
+
+        POST /info
+
+        Get index stats:
+            {"action": "stats"}
+
+        Get usage/quota:
+            {"action": "usage"}
+        """
+        tenant, api_key, error = await self._authenticate(authorization)
+        if error:
+            return error.model_dump()
+
+        action = item.get("action", "stats")
+
+        # === STATS ===
+        if action == "stats":
+            return {
+                "total_items": self.lookup["num_items"],
+                "embedding_dim": self.lookup["embedding_dim"],
+                "index_params": self.lookup["index_params"],
+                "tables": list(set(m["table"] for m in self.lookup["metadata"]))
+            }
+
+        # === USAGE ===
+        elif action == "usage":
+            tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
+            plan_tier = tenant["plan_tier"] if isinstance(tenant, dict) else tenant.plan_tier
+
+            quota_status = await self.usage_service.check_quota(tenant_id, plan_tier)
+
+            return {
+                "period": "current_month",
+                "total_queries": quota_status.used,
+                "quota_limit": quota_status.limit,
+                "quota_remaining": quota_status.remaining,
+                "quota_reset": quota_status.reset_date.isoformat(),
+                "percentage_used": quota_status.percentage_used,
+            }
+
+        else:
+            return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
+
+    # ==================== ENDPOINT 4: API_KEYS (create + list + revoke) ====================
+
+    @modal.web_endpoint(method="POST", docs=True)
+    async def api_keys(self, item: dict, authorization: str = None) -> dict:
+        """
+        API key management endpoint.
+
+        POST /api_keys
+
+        Create key:
+            {"action": "create", "name": "Production Key", "scopes": ["search"]}
+
+        List keys:
+            {"action": "list"}
+
+        Revoke key:
+            {"action": "revoke", "key_id": "uuid-here"}
+        """
+        tenant, api_key, error = await self._authenticate(authorization)
+        if error:
+            return error.model_dump()
+
+        if not self.api_keys:
+            return ErrorResponse(error="API key management not available", code="SERVICE_UNAVAILABLE").model_dump()
+
+        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
+        action = item.get("action", "list")
+
+        # === CREATE ===
+        if action == "create":
+            user_id = api_key.user_id if api_key else "system"
+            name = item.get("name", "API Key")
+            scopes = item.get("scopes", ["search"])
+
+            raw_key, new_key = await self.api_keys.create_key(
+                tenant_id=tenant_id, user_id=user_id,
+                name=name, scopes=scopes
+            )
+
+            return {
+                "key": raw_key,
+                "id": new_key.id,
+                "name": new_key.name,
+                "prefix": new_key.key_prefix,
+                "scopes": new_key.scopes,
+                "created_at": new_key.created_at.isoformat(),
+                "warning": "Save this key! It will not be shown again."
+            }
+
+        # === LIST ===
+        elif action == "list":
+            keys = await self.api_keys.list_keys(tenant_id)
+            return {"keys": keys}
+
+        # === REVOKE ===
+        elif action == "revoke":
+            key_id = item.get("key_id")
+            if not key_id:
+                return ErrorResponse(error="Missing 'key_id'", code="MISSING_PARAM").model_dump()
+
+            success = await self.api_keys.revoke_key(key_id, tenant_id)
+
+            if success:
+                return {"status": "revoked", "key_id": key_id}
+            else:
+                return ErrorResponse(error="Key not found", code="NOT_FOUND").model_dump()
+
+        else:
+            return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
+
+    # ==================== ENDPOINT 5: BILLING (checkout + webhook) ====================
+
+    @modal.web_endpoint(method="POST", docs=True)
+    async def billing(self, item: dict, authorization: str = None) -> dict:
+        """
+        Billing management endpoint.
+
+        POST /billing
+
+        Create checkout session:
+            {"action": "checkout", "plan": "starter", "success_url": "...", "cancel_url": "..."}
+
+        Handle webhook (no auth):
+            {"action": "webhook", "event": {...}}
+        """
+        action = item.get("action", "")
+
+        # === WEBHOOK (no auth required - Stripe sends directly) ===
+        if action == "webhook":
+            if not self.billing:
+                return {"received": True, "processed": False}
+
+            try:
+                event_data = item.get("event", item)
+                await self.billing.handle_webhook(event_data)
+                return {"received": True, "processed": True}
+            except Exception as e:
+                return {"received": True, "processed": False, "error": str(e)}
+
+        # === CHECKOUT (auth required) ===
+        tenant, api_key, error = await self._authenticate(authorization)
+        if error:
+            return error.model_dump()
+
+        if action == "checkout":
+            if not self.billing:
+                return ErrorResponse(error="Billing not available", code="SERVICE_UNAVAILABLE").model_dump()
+
+            plan = item.get("plan", "starter")
+            success_url = item.get("success_url", "https://yourapp.com/success")
+            cancel_url = item.get("cancel_url", "https://yourapp.com/cancel")
+
+            tenant_obj = tenant if not isinstance(tenant, dict) else None
+            if not tenant_obj:
+                return ErrorResponse(error="Tenant not found", code="NOT_FOUND").model_dump()
+
+            customer_id = await self.billing.get_or_create_customer(
+                tenant_obj, email=f"billing@{tenant_obj.slug}.com"
+            )
+
+            checkout_url = await self.billing.create_checkout_session(
+                tenant_id=tenant_obj.id, customer_id=customer_id,
+                plan_tier=plan, success_url=success_url, cancel_url=cancel_url
+            )
+
+            return {"checkout_url": checkout_url}
+
+        else:
+            return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
+
+    # ==================== ENDPOINT 6: SSO (authorize + callback) ====================
+
+    @modal.web_endpoint(method="GET", docs=True)
+    async def sso(self, action: str = "authorize", domain: str = None, email: str = None, code: str = None) -> dict:
+        """
+        SSO authentication endpoint.
+
+        GET /sso?action=authorize&domain=company.com
+        GET /sso?action=authorize&email=user@company.com
+        GET /sso?action=callback&code=auth-code-here
+        """
+        if not self.sso:
+            return ErrorResponse(error="SSO not available", code="SERVICE_UNAVAILABLE").model_dump()
+
+        # === AUTHORIZE ===
+        if action == "authorize":
+            if email and not domain:
+                domain = email.split("@")[1] if "@" in email else None
+
+            if not domain:
+                return ErrorResponse(error="Missing domain or email", code="MISSING_PARAM").model_dump()
+
+            tenant = await self.sso.detect_sso_domain(f"user@{domain}")
+            if not tenant:
+                return ErrorResponse(error="SSO not configured for this domain", code="SSO_NOT_CONFIGURED").model_dump()
+
+            auth_url = self.sso.get_authorization_url(domain=domain)
+            return {"authorization_url": auth_url}
+
+        # === CALLBACK ===
+        elif action == "callback":
+            if not code:
+                return ErrorResponse(error="Missing authorization code", code="MISSING_PARAM").model_dump()
+
+            try:
+                profile, user, tenant = await self.sso.handle_callback(code)
+
+                if not user and tenant:
+                    user = await self.sso.provision_user(profile, tenant.id)
+
+                if user and self.auth:
+                    tokens = self.auth.create_token_pair(
+                        user_id=user.id, tenant_id=user.tenant_id,
+                        email=user.email, role=user.role
+                    )
+                    return {
+                        "access_token": tokens.access_token,
+                        "refresh_token": tokens.refresh_token,
+                        "token_type": tokens.token_type,
+                        "expires_in": tokens.expires_in,
+                        "user": {"id": user.id, "email": user.email, "role": user.role}
+                    }
+
+                return ErrorResponse(error="Unable to authenticate", code="AUTH_FAILED").model_dump()
+
+            except Exception as e:
+                return ErrorResponse(error=f"SSO callback failed: {str(e)}", code="SSO_ERROR").model_dump()
+
+        else:
+            return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
