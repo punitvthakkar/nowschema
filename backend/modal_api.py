@@ -30,6 +30,8 @@ image = modal.Image.debian_slim(python_version="3.11").pip_install(
     # API
     "fastapi[standard]",
     "pydantic>=2.0.0",
+    # Database
+    "supabase>=2.0.0",
     # Utils
     "httpx",
 )
@@ -60,6 +62,14 @@ class QuotaStatus:
     remaining: int
     reset_date: datetime
     percentage_used: float
+
+
+@dataclass
+class APIKeyValidation:
+    valid: bool
+    tenant: Any = None
+    api_key: Any = None
+    error: str = None
 
 
 # ==================== INLINE SERVICES (IN-MEMORY) ====================
@@ -169,6 +179,87 @@ class InMemoryUsageTracker:
         )
 
 
+# ==================== SUPABASE API KEY SERVICE ====================
+
+class SupabaseAPIKeyService:
+    """API Key service using Supabase."""
+
+    def __init__(self, supabase_client):
+        self.db = supabase_client
+
+    def _hash_key(self, key: str) -> str:
+        """Hash an API key using SHA-256."""
+        return hashlib.sha256(key.encode()).hexdigest()
+
+    async def validate_key(self, raw_key: str) -> APIKeyValidation:
+        """Validate an API key and return tenant info."""
+        try:
+            key_hash = self._hash_key(raw_key)
+
+            # Query API key with tenant info
+            result = self.db.table("api_keys").select(
+                "*, tenants(*)"
+            ).eq("key_hash", key_hash).eq("is_active", True).single().execute()
+
+            if not result.data:
+                return APIKeyValidation(valid=False, error="Invalid API key")
+
+            api_key = result.data
+            tenant = api_key.get("tenants")
+
+            # Check expiration
+            if api_key.get("expires_at"):
+                expires = datetime.fromisoformat(api_key["expires_at"].replace("Z", "+00:00"))
+                if expires < datetime.now(timezone.utc):
+                    return APIKeyValidation(valid=False, error="API key expired")
+
+            # Update last used
+            self.db.table("api_keys").update({
+                "last_used_at": datetime.now(timezone.utc).isoformat()
+            }).eq("id", api_key["id"]).execute()
+
+            return APIKeyValidation(valid=True, tenant=tenant, api_key=api_key)
+
+        except Exception as e:
+            print(f"API key validation error: {e}")
+            return APIKeyValidation(valid=False, error="Validation failed")
+
+    async def create_key(self, tenant_id: str, user_id: str, name: str, scopes: List[str] = None) -> tuple:
+        """Create a new API key."""
+        # Generate key: uc_live_<random>
+        raw_key = f"uc_live_{secrets.token_urlsafe(32)}"
+        key_hash = self._hash_key(raw_key)
+        key_prefix = raw_key[:12]
+
+        result = self.db.table("api_keys").insert({
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "name": name,
+            "key_hash": key_hash,
+            "key_prefix": key_prefix,
+            "scopes": scopes or ["search"],
+            "is_active": True,
+        }).execute()
+
+        return raw_key, result.data[0]
+
+    async def list_keys(self, tenant_id: str) -> List[dict]:
+        """List all API keys for a tenant (without exposing hashes)."""
+        result = self.db.table("api_keys").select(
+            "id, name, key_prefix, scopes, created_at, last_used_at, is_active, expires_at"
+        ).eq("tenant_id", tenant_id).order("created_at", desc=True).execute()
+
+        return result.data
+
+    async def revoke_key(self, key_id: str, tenant_id: str) -> bool:
+        """Revoke an API key."""
+        result = self.db.table("api_keys").update({
+            "is_active": False
+        }).eq("id", key_id).eq("tenant_id", tenant_id).execute()
+
+        return len(result.data) > 0
+
+
 # ==================== PYDANTIC MODELS ====================
 
 from pydantic import BaseModel, Field
@@ -190,10 +281,10 @@ class ErrorResponse(BaseModel):
     gpu="T4",
     memory=8192,
     volumes={"/cache": volume},
-    scaledown_window=300,  # Updated from container_idle_timeout
+    scaledown_window=300,
     secrets=[modal.Secret.from_name("uniclass-enterprise-secrets")],
 )
-@modal.concurrent(max_inputs=10)  # Updated from allow_concurrent_inputs
+@modal.concurrent(max_inputs=10)
 class UniclassSearchService:
     """Enterprise Uniclass Search Service with full multi-tenancy."""
 
@@ -225,15 +316,15 @@ class UniclassSearchService:
         with open("/cache/results/uniclass_lookup.json", "r") as f:
             self.lookup = json.load(f)
 
-        # Initialize in-memory services
+        # Initialize enterprise services
         self._init_services()
 
         print(f"✅ Ready! {self.lookup['num_items']} items indexed.")
 
     def _init_services(self):
-        """Initialize enterprise services (all in-memory for now)."""
+        """Initialize enterprise services."""
 
-        # In-memory services (no external dependencies)
+        # In-memory services (always available)
         self.rate_limiter = InMemoryRateLimiter()
         self.cache = InMemoryCache()
         self.usage_service = InMemoryUsageTracker()
@@ -251,7 +342,25 @@ class UniclassSearchService:
             "sso": False,
         }
 
-        print("  → Using in-memory services (no external dependencies)")
+        # Initialize Supabase if configured
+        supabase_url = os.environ.get("SUPABASE_URL", "")
+        supabase_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+        if supabase_url and supabase_key:
+            try:
+                from supabase import create_client
+                self.db = create_client(supabase_url, supabase_key)
+                self.api_key_service = SupabaseAPIKeyService(self.db)
+                self.services_status["database"] = True
+                print("  → Supabase connected")
+            except Exception as e:
+                print(f"  ⚠ Supabase connection failed: {e}")
+                self.db = None
+                self.api_key_service = None
+        else:
+            self.db = None
+            self.api_key_service = None
+            print("  → Supabase not configured (using legacy API key only)")
 
     # ==================== AUTHENTICATION ====================
 
@@ -262,9 +371,17 @@ class UniclassSearchService:
 
         token = authorization.replace("Bearer ", "").strip()
 
-        # Check legacy API key
+        # Check legacy API key first
         if self.legacy_api_key and token == self.legacy_api_key:
             return {"id": "legacy", "plan_tier": "professional"}, None, None
+
+        # Check database API keys if Supabase is configured
+        if self.api_key_service:
+            validation = await self.api_key_service.validate_key(token)
+            if validation.valid:
+                return validation.tenant, validation.api_key, None
+            elif validation.error:
+                return None, None, ErrorResponse(error=validation.error, code="INVALID_API_KEY")
 
         return None, None, ErrorResponse(error="Invalid API key", code="INVALID_API_KEY")
 
@@ -345,11 +462,12 @@ class UniclassSearchService:
         if error:
             return error.model_dump()
 
-        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
-        plan_tier = tenant["plan_tier"] if isinstance(tenant, dict) else tenant.plan_tier
+        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.get("id", "unknown")
+        plan_tier = tenant["plan_tier"] if isinstance(tenant, dict) else tenant.get("plan_tier", "free")
 
         # Rate limit check
-        rate_result = await self._check_rate_limit(tenant_id, plan_tier, None)
+        rate_limit_override = api_key.get("rate_limit_override") if api_key and isinstance(api_key, dict) else None
+        rate_result = await self._check_rate_limit(tenant_id, plan_tier, rate_limit_override)
         if not rate_result.allowed:
             return ErrorResponse(
                 error="Rate limit exceeded",
@@ -473,8 +591,8 @@ class UniclassSearchService:
 
         # === USAGE ===
         elif action == "usage":
-            tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.id
-            plan_tier = tenant["plan_tier"] if isinstance(tenant, dict) else tenant.plan_tier
+            tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.get("id", "unknown")
+            plan_tier = tenant["plan_tier"] if isinstance(tenant, dict) else tenant.get("plan_tier", "free")
 
             quota_status = await self.usage_service.check_quota(tenant_id, plan_tier)
 
@@ -490,19 +608,88 @@ class UniclassSearchService:
         else:
             return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
 
-    # ==================== ENDPOINT 4: API_KEYS (placeholder) ====================
+    # ==================== ENDPOINT 4: API_KEYS (create + list + revoke) ====================
 
     @modal.fastapi_endpoint(method="POST", docs=True)
     async def api_keys(self, item: dict, authorization: str = Header(default=None)) -> dict:
         """
-        API key management endpoint (requires database - placeholder for now).
+        API key management endpoint.
 
         POST /api_keys
+
+        Create key:
+            {"action": "create", "name": "Production Key", "scopes": ["search"]}
+
+        List keys:
+            {"action": "list"}
+
+        Revoke key:
+            {"action": "revoke", "key_id": "uuid-here"}
         """
-        return ErrorResponse(
-            error="API key management requires database connection. Configure Supabase to enable.",
-            code="SERVICE_UNAVAILABLE"
-        ).model_dump()
+        tenant, api_key, error = await self._authenticate(authorization)
+        if error:
+            return error.model_dump()
+
+        if not self.api_key_service:
+            return ErrorResponse(
+                error="API key management requires Supabase. Add SUPABASE_URL and SUPABASE_SERVICE_KEY to Modal secrets.",
+                code="SERVICE_UNAVAILABLE"
+            ).model_dump()
+
+        tenant_id = tenant["id"] if isinstance(tenant, dict) else tenant.get("id")
+        action = item.get("action", "list")
+
+        # === CREATE ===
+        if action == "create":
+            # For legacy API key, we need a user_id - use tenant_id as fallback
+            user_id = api_key.get("user_id") if api_key and isinstance(api_key, dict) else tenant_id
+            name = item.get("name", "API Key")
+            scopes = item.get("scopes", ["search"])
+
+            try:
+                raw_key, new_key = await self.api_key_service.create_key(
+                    tenant_id=tenant_id, user_id=user_id,
+                    name=name, scopes=scopes
+                )
+
+                return {
+                    "key": raw_key,
+                    "id": new_key["id"],
+                    "name": new_key["name"],
+                    "prefix": new_key["key_prefix"],
+                    "scopes": new_key["scopes"],
+                    "created_at": new_key["created_at"],
+                    "warning": "Save this key! It will not be shown again."
+                }
+            except Exception as e:
+                return ErrorResponse(error=f"Failed to create key: {str(e)}", code="CREATE_FAILED").model_dump()
+
+        # === LIST ===
+        elif action == "list":
+            try:
+                keys = await self.api_key_service.list_keys(tenant_id)
+                return {"keys": keys}
+            except Exception as e:
+                return ErrorResponse(error=f"Failed to list keys: {str(e)}", code="LIST_FAILED").model_dump()
+
+        # === REVOKE ===
+        elif action == "revoke":
+            key_id = item.get("key_id")
+            if not key_id:
+                return ErrorResponse(error="Missing 'key_id'", code="MISSING_PARAM").model_dump()
+
+            try:
+                success = await self.api_key_service.revoke_key(key_id, tenant_id)
+
+                if success:
+                    return {"status": "revoked", "key_id": key_id}
+                else:
+                    return ErrorResponse(error="Key not found", code="NOT_FOUND").model_dump()
+            except Exception as e:
+                return ErrorResponse(error=f"Failed to revoke key: {str(e)}", code="REVOKE_FAILED").model_dump()
+
+        else:
+            return ErrorResponse(error=f"Unknown action: {action}", code="INVALID_ACTION").model_dump()
 
     # ==================== ENDPOINT 5: BILLING (placeholder) ====================
 
