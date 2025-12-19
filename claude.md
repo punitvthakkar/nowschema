@@ -145,17 +145,6 @@ nowschema/
 ### 1. Debug Supabase Connection (CRITICAL)
 **Problem**: Modal secrets are configured correctly but the API logs show "Using in-memory services (no external dependencies)" instead of connecting to Supabase.
 
-**To Debug**:
-1. Check Modal App Logs after fresh deployment
-2. Look for "Supabase connected" or "Supabase connection failed: <error>"
-3. Verify environment variables are being read in the container
-4. May need to add debug logging to print env var existence (not values)
-
-**Possible Issues**:
-- Container caching (try stopping app before redeploy)
-- Secret not being injected into container
-- Supabase client initialization failing silently
-
 ### 2. Complete Supabase Integration
 Once connected:
 - Test API key creation via `/api-keys` endpoint
@@ -166,6 +155,8 @@ Once connected:
 - Configure Vercel deployment
 - Set up environment variables
 - Connect to backend API
+
+### 3.5. Create Revit plugin
 
 ### 4. Add Stripe Billing (Later)
 - Create Stripe account
