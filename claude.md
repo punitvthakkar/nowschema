@@ -1,5 +1,17 @@
 # Uniclass Auto-Tagger Project
 
+## 🎯 Recent Update (Dec 2025)
+
+✅ **Supabase Integration Complete!**
+- Database connection successfully established between Modal and Supabase
+- All tables and functions migrated (tenants, users, api_keys, usage_logs, etc.)
+- Persistent API key management now working
+- Health endpoint confirms: `"database": true`
+
+🚀 **Next: Revit Plugin Development**
+
+---
+
 ## Overview
 
 This project automates the translation of natural language element names to Uniclass 2015 classification codes for MEP contractors in the UK construction industry.
@@ -14,7 +26,7 @@ An AI-powered semantic search system that instantly matches natural language des
 
 ---
 
-## Current State: Enterprise Backend (In Progress)
+## Current State: Enterprise Backend ✅
 
 ### What's Working
 
@@ -23,19 +35,21 @@ An AI-powered semantic search system that instantly matches natural language des
 | Core Search API | ✅ Working | Single + batch search on Modal with T4 GPU |
 | Health Endpoint | ✅ Working | No auth required |
 | Legacy API Key Auth | ✅ Working | Uses `UNICLASS_API_KEY` env var |
+| **Supabase Database** | ✅ **Connected** | Successfully connected to PostgreSQL backend |
+| **Persistent API Keys** | ✅ **Ready** | Can create/list/revoke keys via `/api-keys` endpoint |
+| Database Schema | ✅ Working | All tables & functions migrated successfully |
 | In-Memory Rate Limiting | ✅ Working | Per-plan limits (free: 10/min, pro: 300/min) |
 | In-Memory Caching | ✅ Working | Reduces duplicate query latency |
 | In-Memory Usage Tracking | ✅ Working | Quota enforcement |
 | HNSW Vector Index | ✅ Working | 19,022 items indexed |
 
-### What's Not Working Yet
+### What's Not Implemented Yet
 
-| Feature | Status | Issue |
+| Feature | Status | Notes |
 |---------|--------|-------|
-| Supabase Database | ❌ Not Connecting | Secrets exist in Modal but code shows "Using in-memory services" - needs debugging |
-| Persistent API Keys | ❌ Blocked | Requires Supabase connection |
-| Stripe Billing | ⏸️ Placeholder | Not implemented yet |
-| WorkOS SSO | ⏸️ Placeholder | Not implemented yet |
+| Stripe Billing | ⏸️ Placeholder | Returns SERVICE_UNAVAILABLE |
+| WorkOS SSO | ⏸️ Placeholder | Returns SERVICE_UNAVAILABLE |
+| Admin Dashboard | ⏸️ Built | Frontend exists but not deployed to Vercel |
 
 ---
 
@@ -100,6 +114,15 @@ Tables created in Supabase:
 - `tenants` - Organizations using the API
 - `users` - Individual users within tenants
 - `api_keys` - API keys with hash, prefix, scopes, expiry
+- `usage_logs` - API usage tracking per tenant
+- `billing_events` - Stripe webhook events
+- `plan_config` - Plan tier configuration (free/starter/professional/enterprise)
+
+### Debugging Tools
+Created for troubleshooting Modal-Supabase connection:
+- `test_supabase_connection.py` - Local script to verify Supabase connection
+- `debug_connection.md` - Comprehensive troubleshooting guide
+- `infra/supabase/migrations/000_cleanup.sql` - Database reset script
 
 ---
 
@@ -128,13 +151,16 @@ nowschema/
 ├── infra/
 │   └── supabase/
 │       └── migrations/
-│           ├── 001_initial_schema.sql
-│           └── 002_admin_functions.sql
+│           ├── 000_cleanup.sql         # Database reset script
+│           ├── 001_initial_schema.sql  # Core tables and schema
+│           └── 002_admin_functions.sql # Admin functions and views
 ├── .github/
 │   └── workflows/
 │       ├── deploy-backend.yml    # Deploys to Modal
 │       ├── deploy-frontend.yml   # Deploys to Vercel (not configured)
 │       └── setup-secrets.yml     # Sets up Modal secrets
+├── test_supabase_connection.py   # Local Supabase connection test
+├── debug_connection.md           # Troubleshooting guide
 └── claude.md                     # This file
 ```
 
@@ -142,32 +168,52 @@ nowschema/
 
 ## Next Steps (Priority Order)
 
-### 1. Debug Supabase Connection (CRITICAL)
-**Problem**: Modal secrets are configured correctly but the API logs show "Using in-memory services (no external dependencies)" instead of connecting to Supabase.
+### 1. 🚀 Create Revit Plugin (CURRENT PRIORITY)
+**Goal**: Build a Revit plugin that allows MEP contractors to automatically tag elements with Uniclass codes.
 
-### 2. Complete Supabase Integration
-Once connected:
-- Test API key creation via `/api-keys` endpoint
-- Test API key validation (search with database-stored key)
-- Verify `last_used_at` updates on key usage
+**Requirements**:
+- Plugin should integrate into Revit's UI
+- Allow users to:
+  - Select elements in a Revit model
+  - Query the Uniclass API with element names
+  - Apply returned Uniclass codes as parameters to elements
+  - Batch process multiple elements at once
+- Authentication via API key
+- Error handling for API failures
+- Progress indicator for batch operations
 
-### 3. Deploy Admin Frontend
+**Technical Approach**:
+- Language: C# (.NET Framework - Revit API requirement)
+- Use Revit API for element access and parameter modification
+- HTTP client to call Modal endpoints:
+  - `/search` for single element lookups
+  - `/search` with `action: batch` for bulk operations
+- Store API key securely (encrypted in user settings)
+
+**Deliverables**:
+1. Revit add-in (.addin manifest file)
+2. Plugin DLL with UI and API integration
+3. Installer/deployment instructions
+4. User documentation
+
+---
+
+### 2. Deploy Admin Frontend
 - Configure Vercel deployment
 - Set up environment variables
 - Connect to backend API
+- Enable tenant/user management UI
 
-### 3.5. Create Revit plugin
-
-### 4. Add Stripe Billing (Later)
+### 3. Add Stripe Billing (Later)
 - Create Stripe account
-- Set up products/prices
+- Set up products/prices for free/starter/professional/enterprise tiers
 - Implement checkout flow
-- Handle webhooks
+- Handle webhooks for subscription lifecycle
 
-### 5. Add WorkOS SSO (Later)
+### 4. Add WorkOS SSO (Later)
 - Create WorkOS account
-- Configure SAML/OIDC
-- Implement SSO flow
+- Configure SAML/OIDC providers
+- Implement SSO flow for enterprise customers
 
 ---
 
@@ -184,21 +230,57 @@ modal deploy modal_api.py
 ```
 
 ### Run Database Migration
-```sql
--- In Supabase SQL Editor
--- Paste contents of infra/supabase/migrations/001_initial_schema.sql
+```bash
+# In Supabase SQL Editor, run these in order:
+# 1. infra/supabase/migrations/001_initial_schema.sql
+# 2. infra/supabase/migrations/002_admin_functions.sql
+
+# To reset database (WARNING: deletes all data):
+# Run infra/supabase/migrations/000_cleanup.sql first
+```
+
+### Test Supabase Connection Locally
+```bash
+# Install dependencies
+pip install supabase
+
+# Run test script (will prompt for credentials)
+python test_supabase_connection.py
+
+# Or with environment variables
+SUPABASE_URL="https://your-project.supabase.co" \
+SUPABASE_SERVICE_KEY="your-service-key" \
+python test_supabase_connection.py
 ```
 
 ### Test API
 ```bash
-# Health check
+# Health check (should show "database": true)
 curl "https://punitvthakkar--uniclass-api-uniclasssearchservice-health.modal.run"
 
-# Search
+# Create a new API key (using legacy key for auth)
+curl -X POST "https://punitvthakkar--uniclass-api-uniclasssearchservice-api-keys.modal.run" \
+  -H "Authorization: Bearer YGib3sbjtUFXrAHP0CxAnxoIRSNtZasewweaDasda" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "create",
+    "tenant_name": "My Company",
+    "tenant_slug": "my-company",
+    "user_email": "admin@mycompany.com",
+    "key_name": "Production API Key"
+  }'
+
+# Search with API key
 curl -X POST "https://punitvthakkar--uniclass-api-uniclasssearchservice-search.modal.run" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"query": "concrete slab", "top_k": 5}'
+
+# Check usage stats
+curl -X POST "https://punitvthakkar--uniclass-api-uniclasssearchservice-info.modal.run" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "usage"}'
 ```
 
 ---
