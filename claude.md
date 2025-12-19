@@ -14,208 +14,236 @@ An AI-powered semantic search system that instantly matches natural language des
 
 ---
 
-## Current State: Proof of Concept
+## Current State: Enterprise Backend (In Progress)
 
-### Backend Infrastructure (Modal)
+### What's Working
 
-The backend is deployed on [Modal](https://modal.com) with two live applications:
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Core Search API | ✅ Working | Single + batch search on Modal with T4 GPU |
+| Health Endpoint | ✅ Working | No auth required |
+| Legacy API Key Auth | ✅ Working | Uses `UNICLASS_API_KEY` env var |
+| In-Memory Rate Limiting | ✅ Working | Per-plan limits (free: 10/min, pro: 300/min) |
+| In-Memory Caching | ✅ Working | Reduces duplicate query latency |
+| In-Memory Usage Tracking | ✅ Working | Quota enforcement |
+| HNSW Vector Index | ✅ Working | 19,022 items indexed |
 
-#### 1. `uniclass-api` (Production API)
-| Service | Hardware | Type |
-|---------|----------|------|
-| UniclassSearchService.* | T4 GPU | Web endpoint |
+### What's Not Working Yet
 
-#### 2. `uniclass-embeddings` (ML Pipeline)
-| Function | Hardware | Purpose |
-|----------|----------|---------|
-| build_hnsw_index | T4 GPU | Builds HNSW vector index for fast similarity search |
-| download_results | CPU | Data retrieval utilities |
-| embed_texts | T4 GPU | Generates embeddings using Nomic model |
-| search_uniclass | T4 GPU | Performs semantic search against index |
+| Feature | Status | Issue |
+|---------|--------|-------|
+| Supabase Database | ❌ Not Connecting | Secrets exist in Modal but code shows "Using in-memory services" - needs debugging |
+| Persistent API Keys | ❌ Blocked | Requires Supabase connection |
+| Stripe Billing | ⏸️ Placeholder | Not implemented yet |
+| WorkOS SSO | ⏸️ Placeholder | Not implemented yet |
+
+---
+
+## Live Endpoints
+
+### Base URL Pattern
+```
+https://punitvthakkar--uniclass-api-uniclasssearchservice-<endpoint>.modal.run
+```
+
+### Available Endpoints (6 total - Modal free tier limit)
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/health` | GET | None | Health check, shows service status |
+| `/search` | POST | Bearer | Single or batch search |
+| `/info` | POST | Bearer | Stats or usage info |
+| `/api-keys` | POST | Bearer | Create/list/revoke keys (needs Supabase) |
+| `/billing` | POST | Bearer | Placeholder - returns SERVICE_UNAVAILABLE |
+| `/sso` | GET | None | Placeholder - returns SERVICE_UNAVAILABLE |
+
+### Example: Search Request
+```bash
+curl -X POST "https://punitvthakkar--uniclass-api-uniclasssearchservice-search.modal.run" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "door handle", "top_k": 5}'
+```
+
+### Example: Batch Search
+```bash
+curl -X POST "https://punitvthakkar--uniclass-api-uniclasssearchservice-search.modal.run" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "batch", "queries": ["door handle", "steel beam"], "top_k": 5}'
+```
 
 ---
 
 ## Technical Architecture
 
-### Embeddings Model
-- **Model**: Nomic (vector embeddings)
-- **Training Data**: Complete Uniclass 2015 classification system
-- **Coverage**: All code types including:
-  - `Pr_` (Products)
-  - `Ss_` (Systems)
-  - `EF_` (Elements/Functions)
-  - `Ac_` (Activities)
-  - `SL_` (Spaces/Locations)
-  - And other Uniclass tables
+### Backend Stack
+- **Compute**: Modal.com (serverless GPU)
+- **ML Model**: Nomic `nomic-embed-text-v1.5` (768-dim embeddings)
+- **Vector Index**: HNSW via `hnswlib`
+- **API Framework**: FastAPI (via Modal's `@modal.fastapi_endpoint`)
+- **Database**: Supabase (PostgreSQL) - NOT CONNECTED YET
+- **Secrets**: Modal Secrets (`uniclass-enterprise-secrets`)
 
-### Search Algorithm
-- **Index Type**: HNSW (Hierarchical Navigable Small World)
-- **Similarity Metric**: Cosine similarity
-- **Response**: Returns code, title, table, and similarity score
+### Modal Secrets Configuration
+The following secrets are configured in Modal under `uniclass-enterprise-secrets`:
+- `UNICLASS_API_KEY` - Legacy API key for authentication
+- `SUPABASE_URL` - Supabase project URL
+- `SUPABASE_SERVICE_KEY` - Supabase service role key
+- `SUPABASE_ANON_KEY` - Supabase anon key (not used currently)
+- `JWT_SECRET` - For future JWT auth
+- `UPSTASH_REDIS_URL` - For future Redis caching
+- `UPSTASH_REDIS_TOKEN` - For future Redis caching
 
----
-
-## API Endpoints
-
-### Base URLs
-```
-Search (GET):   https://punitvthakkar--uniclass-api-uniclasssearchservice-search-get.modal.run
-Search (POST):  https://punitvthakkar--uniclass-api-uniclasssearchservice-search-post.modal.run
-Batch Search:   https://punitvthakkar--uniclass-api-uniclasssearchservice-batch-search.modal.run
-Health Check:   https://punitvthakkar--uniclass-api-uniclasssearchservice-health.modal.run
-Statistics:     https://punitvthakkar--uniclass-api-uniclasssearchservice-stats.modal.run
-```
-
-### Authentication
-All endpoints (except `/health`) require Bearer token authentication:
-```
-Authorization: Bearer <API_KEY>
-```
-
-### Single Search
-**GET** `/search-get?q=<query>&top_k=<n>`
-
-**POST** `/search-post`
-```json
-{
-  "query": "door handle",
-  "top_k": 5
-}
-```
-
-### Batch Search
-**POST** `/batch-search`
-```json
-{
-  "queries": ["steel beam", "fire alarm", "window glazing"],
-  "top_k": 3
-}
-```
-
-### Response Format
-```json
-{
-  "query": "door handle",
-  "top_k": 5,
-  "count": 5,
-  "results": [
-    {
-      "code": "Pr_30_36_59_25",
-      "title": "Door lever handle sets (Pr_30_36_59_25)",
-      "table": "Products",
-      "similarity": 0.743
-    }
-  ]
-}
-```
-
----
-
-## Performance & Costs
-
-| Metric | Value |
-|--------|-------|
-| Cold start | ~10 seconds |
-| Warm request | <500ms |
-| Cost per search | ~$0.001 |
-| Modal free tier | $30/month credits |
-| Scaling | Auto (0 to N containers) |
-
----
-
-## Planned Frontend Clients
-
-### 1. Revit Plugin (Primary)
-- **Purpose**: Tag drawing elements directly within Autodesk Revit
-- **Workflow**: 
-  1. User selects elements on drawing
-  2. Plugin extracts natural language names
-  3. Batch query to API
-  4. Returns matched Uniclass codes
-  5. Codes applied to element metadata
-
-### 2. Excel Plugin
-- **Purpose**: Bulk processing via spreadsheet
-- **Workflow**:
-  1. Custom Excel formula (e.g., `=UNICLASS("door handle")`)
-  2. Formula calls backend API
-  3. Returns code name and code number to cells
-- **Use Case**: Processing element schedules exported from CAD/BIM
-
-### 3. Web Frontend
-- **Purpose**: Quick lookups and testing
-- **Features**:
-  - Single query interface
-  - Batch upload (CSV/Excel)
-  - Results export
-
----
-
-## Development Roadmap
-
-### ✅ Completed
-- [x] Uniclass 2015 data collection (all tables)
-- [x] Nomic embeddings model training
-- [x] HNSW index construction
-- [x] Modal API deployment
-- [x] Single search endpoint
-- [x] Batch search endpoint
-- [x] API authentication
-
-### 🔄 In Progress
-- [ ] Frontend client development
-- [ ] Revit plugin architecture
-- [ ] Excel add-in development
-
-### 📋 Planned
-- [ ] Web frontend UI
-- [ ] User management & API key provisioning
-- [ ] Usage analytics dashboard
-- [ ] Rate limiting & billing integration
-- [ ] Confidence threshold filtering
-- [ ] Table-specific filtering (search only Pr_, only Ss_, etc.)
+### Supabase Database Schema
+Tables created in Supabase:
+- `tenants` - Organizations using the API
+- `users` - Individual users within tenants
+- `api_keys` - API keys with hash, prefix, scopes, expiry
 
 ---
 
 ## File Structure
 
 ```
-project/
+nowschema/
 ├── backend/
-│   ├── uniclass-api/          # Modal API service
-│   │   └── UniclassSearchService
-│   └── uniclass-embeddings/   # ML pipeline
-│       ├── build_hnsw_index
-│       ├── download_results
-│       ├── embed_texts
-│       └── search_uniclass
-├── data/
-│   └── uniclass_2015/         # Source classification data
-├── docs/
-│   └── UNICLASS_API_DOCS.md   # API documentation
-└── frontends/                  # Planned
-    ├── revit-plugin/
-    ├── excel-addin/
-    └── web-app/
+│   ├── modal_api.py              # Main API (self-contained, no external imports)
+│   └── services/                 # Service modules (NOT USED - kept for reference)
+│       ├── database.py
+│       ├── auth.py
+│       ├── api_keys.py
+│       ├── rate_limit.py
+│       ├── cache.py
+│       ├── usage.py
+│       ├── billing.py
+│       ├── sso.py
+│       └── observability.py
+├── frontend/                     # Next.js admin dashboard (not deployed)
+│   ├── src/
+│   │   ├── app/
+│   │   └── components/
+│   │       └── CredentialsDialog.tsx
+│   └── package.json
+├── infra/
+│   └── supabase/
+│       └── migrations/
+│           ├── 001_initial_schema.sql
+│           └── 002_admin_functions.sql
+├── .github/
+│   └── workflows/
+│       ├── deploy-backend.yml    # Deploys to Modal
+│       ├── deploy-frontend.yml   # Deploys to Vercel (not configured)
+│       └── setup-secrets.yml     # Sets up Modal secrets
+└── claude.md                     # This file
 ```
 
 ---
 
-## Key Value Proposition
+## Next Steps (Priority Order)
 
-| Traditional Process | With This Tool |
-|---------------------|----------------|
-| Hire consultant | Self-service API |
-| Days/weeks turnaround | Instant results |
-| £££ per project | ~£0.001 per query |
-| Manual lookup tables | Semantic AI matching |
-| Human error prone | Consistent accuracy |
+### 1. Debug Supabase Connection (CRITICAL)
+**Problem**: Modal secrets are configured correctly but the API logs show "Using in-memory services (no external dependencies)" instead of connecting to Supabase.
+
+**To Debug**:
+1. Check Modal App Logs after fresh deployment
+2. Look for "Supabase connected" or "Supabase connection failed: <error>"
+3. Verify environment variables are being read in the container
+4. May need to add debug logging to print env var existence (not values)
+
+**Possible Issues**:
+- Container caching (try stopping app before redeploy)
+- Secret not being injected into container
+- Supabase client initialization failing silently
+
+### 2. Complete Supabase Integration
+Once connected:
+- Test API key creation via `/api-keys` endpoint
+- Test API key validation (search with database-stored key)
+- Verify `last_used_at` updates on key usage
+
+### 3. Deploy Admin Frontend
+- Configure Vercel deployment
+- Set up environment variables
+- Connect to backend API
+
+### 4. Add Stripe Billing (Later)
+- Create Stripe account
+- Set up products/prices
+- Implement checkout flow
+- Handle webhooks
+
+### 5. Add WorkOS SSO (Later)
+- Create WorkOS account
+- Configure SAML/OIDC
+- Implement SSO flow
 
 ---
 
-## Notes for Development
+## Development Commands
 
-- Modal containers scale to zero when idle—first request after idle has ~10s latency
-- Batch search is more efficient for bulk operations
-- Similarity scores help assess match confidence (higher = better match)
-- Consider caching frequent queries on frontend clients
+### Deploy Backend
+```bash
+# Via GitHub Actions (recommended)
+# Go to: GitHub → Actions → Deploy Backend to Modal → Run workflow
+
+# Or locally with Modal CLI
+cd backend
+modal deploy modal_api.py
+```
+
+### Run Database Migration
+```sql
+-- In Supabase SQL Editor
+-- Paste contents of infra/supabase/migrations/001_initial_schema.sql
+```
+
+### Test API
+```bash
+# Health check
+curl "https://punitvthakkar--uniclass-api-uniclasssearchservice-health.modal.run"
+
+# Search
+curl -X POST "https://punitvthakkar--uniclass-api-uniclasssearchservice-search.modal.run" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "concrete slab", "top_k": 5}'
+```
+
+---
+
+## API Key for Testing
+Current legacy API key (stored in Modal secrets as `UNICLASS_API_KEY`):
+```
+YGib3sbjtUFXrAHP0CxAnxoIRSNtZasewweaDasda
+```
+
+---
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Cold start | ~20-30 seconds (loading model + index) |
+| Warm request | ~500-800ms |
+| Items indexed | 19,022 |
+| Embedding dimension | 768 |
+| GPU | NVIDIA T4 |
+
+---
+
+## Cost Estimates (Modal)
+
+| Plan | Monthly Cost |
+|------|-------------|
+| Free tier | $30 credits |
+| Current usage | ~$4.50 remaining |
+
+---
+
+## Notes
+
+- Modal containers scale to zero when idle - first request after idle has cold start latency
+- The `modal_api.py` file is self-contained with no external module imports (required for Modal deployment)
+- All enterprise service modules in `backend/services/` are kept for reference but not used
+- Frontend is built but not deployed - waiting for backend database integration
